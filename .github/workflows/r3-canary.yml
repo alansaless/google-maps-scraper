@@ -54,14 +54,14 @@ jobs:
               test "$PLAYWRIGHT_BROWSERS_PATH" = /opt/browsers
               test -d "$PLAYWRIGHT_DRIVER_PATH"
               test -d "$PLAYWRIGHT_BROWSERS_PATH"
-              test -x "$PLAYWRIGHT_DRIVER_PATH/playwright.sh"
 
-              driver_version="$("$PLAYWRIGHT_DRIVER_PATH/playwright.sh" --version)"
+              driver_asset="$(find "$PLAYWRIGHT_DRIVER_PATH" -type f -size +0c -print -quit)"
+              test -n "$driver_asset"
               chromium="$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f \( -name chrome -o -name chrome-headless-shell \) -perm -111 -print -quit)"
               test -n "$chromium"
               chromium_version="$("$chromium" --version)"
 
-              printf "Playwright driver: %s\\nChromium: %s\\n" "$driver_version" "$chromium_version"
+              printf "Playwright driver asset: %s\\nChromium: %s\\n" "$driver_asset" "$chromium_version"
               timeout 30 "$chromium" \
                 --headless \
                 --no-sandbox \

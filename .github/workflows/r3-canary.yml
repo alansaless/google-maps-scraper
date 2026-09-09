@@ -1,0 +1,200 @@
+name: R3 classic web canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r3-classic-web-canary-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classic-web-canary:
+    name: Classic web Docker canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      IMAGE: alansaless/google-maps-scraper:1.17.4-r3-canary
+      CANARY_CONTAINER: r3-classic-web-canary
+      CANARY_PORT: "18080"
+
+    steps:
+      - name: Checkout the dispatched revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate checked out SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$GITHUB_SHA"
+          printf 'Checked out SHA: %s\n' "$actual_sha"
+
+      - name: Build the classic Dockerfile locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --file ./Dockerfile --tag "$IMAGE" .
+
+      - name: Validate bundled Playwright driver and Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g \
+            --entrypoint /bin/sh \
+            "$IMAGE" -ec '
+              test "$PLAYWRIGHT_DRIVER_PATH" = /opt/ms-playwright-go
+              test "$PLAYWRIGHT_BROWSERS_PATH" = /opt/browsers
+              test -d "$PLAYWRIGHT_DRIVER_PATH"
+              test -d "$PLAYWRIGHT_BROWSERS_PATH"
+              test -x "$PLAYWRIGHT_DRIVER_PATH/playwright.sh"
+
+              driver_version="$("$PLAYWRIGHT_DRIVER_PATH/playwright.sh" --version)"
+              chromium="$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f \( -name chrome -o -name chrome-headless-shell \) -perm -111 -print -quit)"
+              test -n "$chromium"
+              chromium_version="$("$chromium" --version)"
+
+              printf "Playwright driver: %s\\nChromium: %s\\n" "$driver_version" "$chromium_version"
+              timeout 30 "$chromium" \
+                --headless \
+                --no-sandbox \
+                --disable-gpu \
+                --user-data-dir=/tmp/chromium-profile \
+                --dump-dom about:blank | grep -q "<html"
+            '
+
+      - name: Start isolated classic web canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/r3-webdata"
+          docker run --detach \
+            --name "$CANARY_CONTAINER" \
+            --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g \
+            --shm-size=1g \
+            --network bridge \
+            --publish "127.0.0.1:${CANARY_PORT}:8080" \
+            --volume "$RUNNER_TEMP/r3-webdata:/data" \
+            --env DISABLE_TELEMETRY=1 \
+            --env HOME=/tmp \
+            --env XDG_CACHE_HOME=/tmp/.cache \
+            "$IMAGE" \
+            -web -addr :8080 -data-folder /data -c 1
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error \
+              "http://127.0.0.1:${CANARY_PORT}/api/v1/jobs" | jq -e 'type == "array"' >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Classic web server did not become ready." >&2
+          exit 1
+
+      - name: Verify classic web API contract and minimal browser search
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="http://127.0.0.1:${CANARY_PORT}"
+          job_payload='{"name":"r3-canary","keywords":["coffee shops in Berlin Germany"],"lang":"en","zoom":15,"depth":1,"max_time":180}'
+
+          job_id="$(curl --fail --silent --show-error \
+            --header 'Content-Type: application/json' \
+            --data "$job_payload" \
+            "$base_url/api/v1/jobs" | jq --exit-status --raw-output '.id')"
+          test -n "$job_id"
+          printf 'SUBMITTED=%s\n' "$job_id" | tee "$RUNNER_TEMP/r3-canary-transitions.txt"
+
+          initial_job="$(curl --fail --silent --show-error "$base_url/api/v1/jobs/$job_id")"
+          jq --exit-status --arg id "$job_id" \
+            '.ID == $id and (.Status == "pending" or .Status == "working")' \
+            <<<"$initial_job" >/dev/null
+
+          observed_working=false
+          terminal_status=""
+          for attempt in $(seq 1 300); do
+            job="$(curl --fail --silent --show-error "$base_url/api/v1/jobs/$job_id")"
+            status="$(jq --exit-status --raw-output '.Status' <<<"$job")"
+            printf '%s\n' "$status" >> "$RUNNER_TEMP/r3-canary-transitions.txt"
+
+            case "$status" in
+              pending)
+                ;;
+              working)
+                observed_working=true
+                ;;
+              ok)
+                terminal_status="$status"
+                break
+                ;;
+              failed)
+                echo "Job failed: $job" >&2
+                exit 1
+                ;;
+              *)
+                echo "Unexpected job status: $job" >&2
+                exit 1
+                ;;
+            esac
+            sleep 1
+          done
+
+          test "$observed_working" = true
+          test "$terminal_status" = ok
+          printf 'TERMINAL=%s\n' "$terminal_status" >> "$RUNNER_TEMP/r3-canary-transitions.txt"
+
+          curl --fail --silent --show-error \
+            --dump-header "$RUNNER_TEMP/r3-canary-download.headers" \
+            --output "$RUNNER_TEMP/r3-canary-results.csv" \
+            "$base_url/api/v1/jobs/$job_id/download"
+          grep --ignore-case --quiet '^content-type: text/csv' "$RUNNER_TEMP/r3-canary-download.headers"
+          test -s "$RUNNER_TEMP/r3-canary-results.csv"
+          awk 'NR > 1 && NF { found = 1 } END { exit !found }' "$RUNNER_TEMP/r3-canary-results.csv"
+
+          {
+            echo 'API_COMPATIBILITY=COMPATIBLE'
+            echo 'PLAYWRIGHT_DRIVER_BROWSER_COMPATIBILITY=CONFIRMED_BY_BROWSER_JOB'
+            echo 'RUNTIME_DOWNLOAD_GUARD=PASS_READ_ONLY_RUNTIME'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect canary diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logs "$CANARY_CONTAINER" > "$RUNNER_TEMP/r3-canary.log" 2>&1 || true
+          docker inspect "$CANARY_CONTAINER" > "$RUNNER_TEMP/r3-canary-inspect.json" 2>&1 || true
+          cat "$RUNNER_TEMP/r3-canary.log" || true
+          if grep --ignore-case --quiet 'panic:' "$RUNNER_TEMP/r3-canary.log"; then
+            echo 'Canary logs contain a panic.' >&2
+            exit 1
+          fi
+
+      - name: Upload canary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r3-classic-web-canary-evidence
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/r3-canary.log
+            ${{ runner.temp }}/r3-canary-inspect.json
+            ${{ runner.temp }}/r3-canary-transitions.txt
+            ${{ runner.temp }}/r3-canary-download.headers
+            ${{ runner.temp }}/r3-canary-results.csv
+            ${{ runner.temp }}/r3-webdata
+
+      - name: Remove only the canary container
+        if: always()
+        shell: bash
+        run: |
+          docker rm --force "$CANARY_CONTAINER" || true

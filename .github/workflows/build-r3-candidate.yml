@@ -1,0 +1,54 @@
+name: Build R3 candidate image
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and publish immutable R3 candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: ghcr.io/alansaless/google-maps-scraper
+      TAG: 1.17.4-r3.1
+      SOURCE_SHA: 17cd87c95d8eceead80d4cd2ef9cd89d09e4d3cb
+
+    steps:
+      - name: Check out validated main revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Validate checked out SHA
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish candidate
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.version=${{ env.TAG }}
+
+      - name: Record immutable image reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ steps.build.outputs.digest }}"
+          printf '%s@%s\n' "$IMAGE" "${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"

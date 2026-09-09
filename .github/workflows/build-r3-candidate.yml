@@ -5,6 +5,9 @@ permissions:
   packages: write
 
 on:
+  pull_request:
+    branches: [main]
+    types: [opened]
   workflow_dispatch:
 
 jobs:

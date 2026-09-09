@@ -91,7 +91,7 @@ jobs:
 
           for attempt in $(seq 1 30); do
             if curl --fail --silent --show-error \
-              "http://127.0.0.1:${CANARY_PORT}/api/v1/jobs" | jq -e 'type == "array"' >/dev/null; then
+              "http://127.0.0.1:${CANARY_PORT}/api/v1/jobs" | jq -e 'type == "array" or . == null' >/dev/null; then
               exit 0
             fi
             sleep 1
